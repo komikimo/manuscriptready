@@ -1,12 +1,7 @@
-"""
-API Schemas — Pydantic Models
-"""
+"""API Schemas"""
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Literal
-from datetime import datetime
 
-
-# ── Auth ─────────────────────────────────
 class SignupReq(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
@@ -25,49 +20,39 @@ class UserOut(BaseModel):
 class AuthResp(BaseModel):
     access_token: str; token_type: str = "bearer"; user: UserOut
 
-# ── Subscription ─────────────────────────
 class SubInfo(BaseModel):
     tier: str; status: str; words_used: int; words_limit: int; words_remaining: int
 
-class CheckoutReq(BaseModel):
-    tier: Literal["starter","pro","team"]; success_url: str; cancel_url: str
-
-# ── Reviewer Alert ───────────────────────
 class ReviewerAlert(BaseModel):
     sentence: str
-    issue_type: Literal["vague_claim","overclaiming","unclear_method","unsupported_conclusion",
-                         "logical_gap","weak_causation","inconsistent_term","missing_hedging"]
-    severity: Literal["high","medium","low"]
+    issue_type: str
+    severity: Literal["high", "medium", "low"]
     explanation: str
     suggestion: str
 
-# ── Terminology Issue ────────────────────
 class TermIssue(BaseModel):
-    term: str
-    issue: str  # e.g. "Acronym not introduced", "Inconsistent usage"
-    suggestion: str
+    term: str; issue: str; suggestion: str
 
-# ── Publication Readiness Score ──────────
 class PubScore(BaseModel):
-    overall: float = 0        # 0-100
-    clarity: float = 0        # 0-100
-    academic_tone: float = 0  # 0-100
-    coherence: float = 0      # 0-100
+    overall: float = 0
+    clarity: float = 0
+    academic_tone: float = 0
+    coherence: float = 0
     term_consistency: float = 0
-    reviewer_risk: float = 0  # 0-100 (lower = better)
+    reviewer_risk: float = 0
     readability_fre: float = 0
     grade_level: float = 0
     label: str = ""
 
-# ── Processing ───────────────────────────
 class TextProcessReq(BaseModel):
     text: str = Field(..., min_length=10, max_length=100_000)
-    mode: Literal["enhance","translate_enhance"] = "enhance"
+    mode: Literal["enhance", "translate_enhance"] = "enhance"
     source_language: str = "auto"
-    section_type: Literal["general","abstract","methods","results","discussion","introduction"] = "general"
+    section_type: Literal["general", "abstract", "methods", "results",
+                           "discussion", "introduction"] = "general"
 
 class DiffItem(BaseModel):
-    type: Literal["unchanged","added","removed","modified"]
+    type: Literal["unchanged", "added", "removed", "modified"]
     original: str = ""
     improved: str = ""
 
@@ -80,14 +65,13 @@ class ProcessResult(BaseModel):
     reviewer_alerts: List[ReviewerAlert] = []
     terminology_issues: List[TermIssue] = []
     terms_preserved: List[str] = []
-    meaning_safeguards: dict = {}  # {numbers_preserved, citations_preserved, etc.}
+    meaning_safeguards: dict = {}
     section_type: str = "general"
     stats: dict = {}
     processing_time_ms: int = 0
 
-# ── Dashboard ────────────────────────────
 class DocSummary(BaseModel):
-    id: str; title: str; section_type: str; word_count: int; status: str
+    id: str; title: str; section_type: str; word_count: int
     score_before: dict; score_after: dict; created_at: str
     class Config:
         from_attributes = True

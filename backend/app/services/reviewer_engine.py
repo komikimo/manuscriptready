@@ -1,236 +1,267 @@
 """
 ManuscriptReady — Reviewer Intelligence Engine
 ════════════════════════════════════════════════
-Analyzes text for issues that peer reviewers commonly flag.
-Combines rule-based pattern detection with GPT-powered analysis.
-
-Categories:
-  - Vague claims ("some researchers suggest...")
-  - Overclaiming ("clearly proves", "definitively shows")
-  - Unclear methodology ("the data was processed")
-  - Unsupported conclusions (claims without evidence/citation)
-  - Logical gaps (missing connections)
-  - Weak causation ("X leads to Y" without evidence)
+Detects issues that peer reviewers commonly flag:
+  - Vague claims without citations
+  - Overclaiming / absolute language
+  - Unclear methodology
+  - Unsupported conclusions
+  - Logical gaps
+  - Weak causation
   - Inconsistent terminology
-  - Missing hedging
+  - Missing academic hedging
+
+Two layers:
+  1. Rule-based pattern matching (fast, always runs)
+  2. GPT-powered deep analysis (Pro/Team tiers)
 """
 
 import re
+import json
 import logging
 from typing import List, Tuple
 from openai import AsyncOpenAI
 
 from app.core.config import settings
-from app.models.schemas import ReviewerAlert
+from app.models.schemas import ReviewerAlert, TermIssue
 
 logger = logging.getLogger(__name__)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  RULE-BASED PATTERN DETECTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  RULE-BASED DETECTION (always runs)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# (pattern, issue_type, severity, explanation, suggestion_template)
-PATTERNS: List[Tuple[str, str, str, str, str]] = [
-    # Overclaiming
-    (r'\b(?:clearly|obviously|undoubtedly|undeniably|definitively)\s+(?:proves?|shows?|demonstrates?)\b',
+# Each rule: (regex, issue_type, severity, explanation, suggestion)
+RULES = [
+    # ── Overclaiming ──
+    (r'\b(?:clearly|obviously|undoubtedly|definitively)\s+(?:proves?|shows?|demonstrates?)\b',
      "overclaiming", "high",
-     "Strong claim without hedging — reviewers will question the certainty level",
-     "Use hedging: 'strongly suggests' or 'provides compelling evidence for'"),
+     "Strong certainty claim — reviewers challenge absolute language in empirical research",
+     "Use hedging: 'strongly suggests' or 'provides compelling evidence'"),
 
-    (r'\b(?:proves?\s+(?:that|beyond))\b',
+    (r'\bproves?\s+(?:that|beyond)\b',
      "overclaiming", "high",
-     "'Prove' is almost never appropriate in empirical research — reviewers will challenge this",
+     "'Prove' is nearly never appropriate in empirical research",
      "Replace with 'demonstrates', 'indicates', or 'provides evidence that'"),
 
     (r'\bfor the first time\b',
      "overclaiming", "medium",
-     "Novelty claims are heavily scrutinized — reviewers will check if this is truly first",
-     "Soften to 'to our knowledge, this is the first...' or verify the claim thoroughly"),
+     "Novelty claims are heavily scrutinized by reviewers",
+     "Add qualifier: 'to our knowledge, for the first time...'"),
 
-    # Vague claims
-    (r'\b(?:some|several|many|various|numerous)\s+(?:researchers?|studies|authors?|reports?)\s+(?:have\s+)?(?:shown?|suggest|indicate|report)',
+    (r'\bnovel\b(?!\s+(?:approach|method|technique|strategy))(?<!may\s+indicate\s+a\s+novel)(?<!could\s+represent\s+a\s+novel)',
+     "overclaiming", "low",
+     "Overuse of 'novel' — reviewers are skeptical of novelty claims",
+     "Remove or justify with specific comparison to prior work"),
+
+    # ── Vague Claims ──
+    (r'\b(?:some|several|many|various)\s+(?:researchers?|studies|authors?|reports?)\s+(?:have\s+)?(?:shown?|suggest|indicate)',
      "vague_claim", "medium",
-     "Vague attribution — reviewers expect specific citations",
+     "Vague attribution without specific citations — reviewers expect references",
      "Replace with specific citations: 'Smith et al. (2023) demonstrated...'"),
 
     (r'\b(?:it is (?:well )?known that|as is well known|it is generally accepted)',
      "vague_claim", "medium",
-     "Unsupported common-knowledge claim — reviewers may dispute this",
+     "Unsupported common-knowledge claim — a reviewer may dispute this",
      "Add a citation or rephrase with specific evidence"),
 
-    (r'\b(?:etc|and so on|and so forth|among others)\b',
+    (r'\betc\.?\b|\band so on\b|\band so forth\b',
      "vague_claim", "low",
-     "'etc.' is imprecise — reviewers prefer exhaustive lists or explicit scope",
-     "Either list all items or use 'including X, Y, and Z'"),
+     "'etc.' is imprecise — reviewers prefer specificity",
+     "List all items or use 'including X, Y, and Z'"),
 
-    # Unclear methodology
+    (r'\b(?:recent|previous|prior)\s+(?:studies?|research|work|investigations?)\b(?!.*[\[\(])',
+     "vague_claim", "medium",
+     "References prior work without citation",
+     "Add specific citation after this claim"),
+
+    # ── Unclear Methodology ──
     (r'\bdata (?:was|were) (?:collected|gathered|obtained|processed|analyzed)\b(?!.*(?:using|via|by|with|through))',
      "unclear_method", "high",
-     "Method description lacks specificity — reviewers need to know HOW",
-     "Specify the method/tool/technique used for data collection/analysis"),
+     "Method description lacks specificity — reviewers need HOW",
+     "Specify the technique, instrument, or software used"),
 
-    (r'\b(?:standard|conventional|typical|usual|normal)\s+(?:method|procedure|protocol|technique)\b(?!.*(?:\(|\[|described))',
+    (r'\b(?:standard|conventional|typical|usual)\s+(?:method|procedure|protocol)\b(?!.*[\(\[])',
      "unclear_method", "medium",
-     "References a 'standard' method without naming it — reviewers will ask which one",
+     "References 'standard' method without naming it",
      "Name the specific method and cite the reference protocol"),
 
-    (r'\b(?:appropriate|suitable|proper|adequate)\s+(?:statistical|analysis|method)',
+    (r'\b(?:appropriate|suitable|proper)\s+(?:statistical|analysis|method)',
      "unclear_method", "medium",
-     "Too vague — reviewers need to know the specific method used",
+     "Vague method description — reviewers need specifics",
      "Name the exact statistical test or analytical method"),
 
-    # Unsupported conclusions
-    (r'\b(?:therefore|thus|hence|consequently|accordingly),?\s+(?:we|it|this)\s+(?:can|may|could)\s+(?:conclude|state|claim)',
-     "unsupported_conclusion", "medium",
-     "Conclusion should be directly tied to presented evidence",
-     "Ensure the preceding sentence(s) contain supporting data or references"),
-
-    # Logical gaps
+    # ── Logical Gaps ──
     (r'\b(?:interestingly|surprisingly|unexpectedly|remarkably|notably),?\s',
      "logical_gap", "low",
      "Subjective qualifier — reviewers prefer objective statements",
-     "Remove the qualifier or explain WHY this is interesting/surprising with evidence"),
+     "Remove or explain WHY this is interesting with evidence"),
 
-    # Weak causation
-    (r'\b(?:leads?\s+to|causes?|results?\s+in|gives?\s+rise\s+to)\b(?!.*(?:suggest|may|might|could|possibly))',
+    # ── Weak Causation ──
+    (r'\b(?:leads?\s+to|causes?|results?\s+in|gives?\s+rise\s+to)\b(?!.*(?:suggest|may|might|could))',
      "weak_causation", "medium",
-     "Causal claim without hedging — unless proven, this may be challenged",
+     "Causal claim without hedging — may be challenged unless proven",
      "Add hedging: 'may lead to', 'is associated with', 'appears to contribute to'"),
 
-    # Missing hedging
+    # ── Missing Hedging ──
     (r'\b(?:will|always|never|all|none|every|no)\s+(?:result|show|demonstrate|produce|cause|prevent)\b',
      "missing_hedging", "medium",
      "Absolute language — academic writing requires hedging for empirical claims",
      "Soften: 'will' → 'is expected to', 'always' → 'typically', 'never' → 'rarely'"),
+
+    # ── Unsupported Conclusion ──
+    (r'\b(?:therefore|thus|hence),?\s+(?:we|it|this)\s+(?:can\s+)?conclude',
+     "unsupported_conclusion", "medium",
+     "Conclusion statement should be directly tied to presented evidence",
+     "Ensure preceding data directly supports this conclusion"),
 ]
 
 
-def detect_reviewer_issues_rules(text: str) -> List[ReviewerAlert]:
-    """Fast rule-based detection of common reviewer concerns."""
-    alerts = []
+def detect_rule_based(text: str) -> List[ReviewerAlert]:
+    """Fast pattern-based detection of reviewer issues."""
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'(\[])', text)
+    alerts = []
+    hedging_words = re.compile(r'\b(?:may|might|could|suggest|appears?|potentially|possibly|indicate)\b', re.I)
 
     for sent in sentences:
         sent = sent.strip()
-        if not sent or len(sent) < 15:
+        if len(sent) < 15:
             continue
+        has_hedging = bool(hedging_words.search(sent))
 
-        for pattern, issue_type, severity, explanation, suggestion in PATTERNS:
+        for pattern, itype, severity, expl, sug in RULES:
             if re.search(pattern, sent, re.IGNORECASE):
+                # Skip low-severity overclaiming if sentence already has hedging
+                if itype == "overclaiming" and severity == "low" and has_hedging:
+                    continue
                 alerts.append(ReviewerAlert(
                     sentence=sent[:200],
-                    issue_type=issue_type,
+                    issue_type=itype,
                     severity=severity,
-                    explanation=explanation,
-                    suggestion=suggestion,
+                    explanation=expl,
+                    suggestion=sug,
                 ))
-                break  # One alert per sentence to avoid noise
+                break  # One alert per sentence
 
     return alerts
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  GPT-POWERED DEEP ANALYSIS (for Pro/Team tiers)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  GPT-POWERED DEEP ANALYSIS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-REVIEWER_ANALYSIS_PROMPT = """You are an experienced peer reviewer for a top-tier international journal.
-Analyze the following academic text and identify SPECIFIC sentences or phrases that would likely trigger reviewer criticism.
+REVIEWER_PROMPT = """You are an experienced peer reviewer for a top international journal.
+Identify SPECIFIC sentences that would trigger reviewer criticism.
 
-For each issue found, provide:
-1. The exact problematic sentence (first 150 chars)
-2. Issue type: one of [vague_claim, overclaiming, unclear_method, unsupported_conclusion, logical_gap, weak_causation, inconsistent_term, missing_hedging]
-3. Severity: high, medium, or low
-4. Brief explanation of why a reviewer would flag this
-5. A specific suggestion for improvement
+For each issue, return JSON:
+[{"sentence":"first 150 chars","issue_type":"one of: vague_claim|overclaiming|unclear_method|unsupported_conclusion|logical_gap|weak_causation|inconsistent_term|missing_hedging","severity":"high|medium|low","explanation":"why a reviewer flags this","suggestion":"how to fix"}]
 
-Format your response as a JSON array:
-[
-  {
-    "sentence": "...",
-    "issue_type": "...",
-    "severity": "...",
-    "explanation": "...",
-    "suggestion": "..."
-  }
-]
-
-If no significant issues found, return: []
-
-Analyze ONLY what's written — do not flag correct hedged statements or well-supported claims.
-Return ONLY the JSON array, nothing else."""
+If no issues: return []
+Only flag genuine problems. Don't flag correct hedged statements.
+Return ONLY the JSON array."""
 
 
-async def detect_reviewer_issues_ai(text: str) -> List[ReviewerAlert]:
-    """GPT-powered deep analysis for reviewer concerns."""
+async def detect_ai_powered(text: str) -> List[ReviewerAlert]:
+    """GPT deep analysis of reviewer concerns."""
     try:
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-
-        # Truncate to avoid token limits
-        analysis_text = text[:6000]
-
-        response = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
-            temperature=0.1,
-            max_tokens=2000,
+        r = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL, temperature=0.1, max_tokens=2000,
             messages=[
-                {"role": "system", "content": REVIEWER_ANALYSIS_PROMPT},
-                {"role": "user", "content": analysis_text},
+                {"role": "system", "content": REVIEWER_PROMPT},
+                {"role": "user", "content": text[:6000]},
             ],
         )
-
-        content = response.choices[0].message.content.strip()
-        # Clean JSON
-        content = content.strip("`").strip()
+        content = r.choices[0].message.content.strip().strip("`")
         if content.startswith("json"):
             content = content[4:].strip()
-
-        import json
         items = json.loads(content)
-        alerts = []
-        valid_types = {"vague_claim","overclaiming","unclear_method","unsupported_conclusion",
-                       "logical_gap","weak_causation","inconsistent_term","missing_hedging"}
-        for item in items[:15]:  # Cap at 15 alerts
-            it = item.get("issue_type", "vague_claim")
-            if it not in valid_types:
-                it = "vague_claim"
-            alerts.append(ReviewerAlert(
-                sentence=item.get("sentence", "")[:200],
-                issue_type=it,
-                severity=item.get("severity", "medium"),
-                explanation=item.get("explanation", ""),
-                suggestion=item.get("suggestion", ""),
-            ))
-        return alerts
-
+        valid_types = {"vague_claim", "overclaiming", "unclear_method", "unsupported_conclusion",
+                       "logical_gap", "weak_causation", "inconsistent_term", "missing_hedging"}
+        return [
+            ReviewerAlert(
+                sentence=it.get("sentence", "")[:200],
+                issue_type=it["issue_type"] if it.get("issue_type") in valid_types else "vague_claim",
+                severity=it.get("severity", "medium"),
+                explanation=it.get("explanation", ""),
+                suggestion=it.get("suggestion", ""),
+            )
+            for it in items[:15]
+        ]
     except Exception as e:
         logger.error(f"AI reviewer analysis failed: {e}")
         return []
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  COMBINED ANALYSIS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TERMINOLOGY CONSISTENCY
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def analyze_reviewer_risks(text: str, deep: bool = False) -> List[ReviewerAlert]:
-    """
-    Combined reviewer risk analysis.
-    Rules-based always runs. AI analysis for deep=True (Pro/Team tiers).
-    """
-    # Always run fast rules
-    rule_alerts = detect_reviewer_issues_rules(text)
+def check_terminology(text: str) -> Tuple[float, List[TermIssue]]:
+    """Check acronym introduction, term consistency, units, tense."""
+    issues = []
+    score = 100.0
+
+    # Acronym introduction check
+    common_words = {"THE", "AND", "FOR", "ARE", "BUT", "NOT", "ALL", "WAS", "ONE", "OUR", "HAS"}
+    acronyms = {a for a in re.findall(r'\b([A-Z]{2,})\b', text) if a not in common_words}
+
+    for acr in acronyms:
+        intro = rf'\b\w[\w\s]{{2,40}}\({re.escape(acr)}\)'
+        if not re.search(intro, text) and text.count(acr) > 1:
+            issues.append(TermIssue(
+                term=acr,
+                issue="Acronym used without introduction",
+                suggestion=f"First mention should be 'Full Name ({acr})'",
+            ))
+            score -= 5
+
+    # Tense consistency within paragraphs
+    for para in text.split("\n\n"):
+        if not para.strip():
+            continue
+        past = len(re.findall(r'\b(?:was|were|had|showed|found|demonstrated|analyzed|measured)\b', para, re.I))
+        present = len(re.findall(r'\b(?:is|are|has|shows?|finds?|demonstrates?|analyzes?)\b', para, re.I))
+        if past > 2 and present > 2:
+            score -= 3
+
+    # Unit formatting consistency
+    units = re.findall(r'\d\s*(mg|mL|ml|µL|uL|kg|g|cm|mm|µm|um|nm|°C|K)\b', text)
+    seen = {}
+    for u in units:
+        low = u.lower()
+        if low not in seen:
+            seen[low] = set()
+        seen[low].add(u)
+    for low, variants in seen.items():
+        if len(variants) > 1:
+            issues.append(TermIssue(
+                term=", ".join(sorted(variants)),
+                issue="Inconsistent unit formatting",
+                suggestion="Standardize to one format throughout",
+            ))
+            score -= 5
+
+    return max(0, min(100, score)), issues
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  COMBINED ANALYSIS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def analyze_text(text: str, deep: bool = False) -> List[ReviewerAlert]:
+    """Run reviewer analysis. Rules always; GPT for deep=True."""
+    alerts = detect_rule_based(text)
 
     if deep:
-        ai_alerts = await detect_reviewer_issues_ai(text)
-        # Merge, deduplicate by similarity
-        seen_sentences = {a.sentence[:60] for a in rule_alerts}
+        ai_alerts = await detect_ai_powered(text)
+        seen = {a.sentence[:60] for a in alerts}
         for a in ai_alerts:
-            if a.sentence[:60] not in seen_sentences:
-                rule_alerts.append(a)
-                seen_sentences.add(a.sentence[:60])
+            if a.sentence[:60] not in seen:
+                alerts.append(a)
+                seen.add(a.sentence[:60])
 
-    # Sort by severity
-    severity_order = {"high": 0, "medium": 1, "low": 2}
-    rule_alerts.sort(key=lambda a: severity_order.get(a.severity, 2))
-
-    return rule_alerts[:20]  # Cap at 20
+    sev = {"high": 0, "medium": 1, "low": 2}
+    alerts.sort(key=lambda a: sev.get(a.severity, 2))
+    return alerts[:20]
