@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.database import User, Subscription, Organization, Membership, get_db
+from sqlalchemy.orm import Session
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
